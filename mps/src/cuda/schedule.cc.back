@@ -1,0 +1,204 @@
+#include<stdio.h>
+#include<iostream>
+#include<stdlib.h>
+#include<vector>
+#include<string>
+#include<map>
+#include<fstream>
+#include<sstream>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <pthread.h>
+#define MAX_PRO_SIZE 100
+using namespace std;
+#define MAX_MEMORY_ALLOCATIONS 16
+
+typedef struct {
+	string kernel_name;//Kernel's name
+	int id;//process id
+	int GPU_ratio;//sum of GPU resources
+	int process_flag;//0��ʶ����׼���ã�����Ե��ȣ������������Ϊ1
+	int change_flag;//-1��ʶ���õ��ȣ�0��ʶ�����л���1��ʶ��Ҫ�л�
+}schedule;
+
+typedef struct{
+	std::tuple<void *, cudaIpcMemHandle_t> memoryAllocations[MAX_MEMORY_ALLOCATIONS];
+	int allocationIndex;
+	schedule sch;
+	struct KernelCall
+	{
+		//const void *fptr;
+		uintptr_t fptr;
+		dim3 gridDim, blockDim;
+		size_t sharedMem;
+		int n_args;
+		unsigned char arg_buf[4096];
+		short arg_offset[128];
+		void *argv[128];
+	} k_call;
+	struct SyncEnforce
+	{
+		pthread_mutex_t mutex;
+		pthread_barrier_t barrier;
+	} sync;
+	void init()
+	{
+		pthread_mutexattr_t mutexattr;
+		pthread_mutexattr_init(&mutexattr);
+		pthread_mutexattr_setpshared(&mutexattr, PTHREAD_PROCESS_SHARED);
+		pthread_mutex_init(&sync.mutex, &mutexattr);
+		pthread_mutexattr_destroy(&mutexattr);
+		pthread_barrierattr_t barrierattr;
+		pthread_barrierattr_init(&barrierattr);
+		pthread_barrierattr_setpshared(&barrierattr, PTHREAD_PROCESS_SHARED);
+		pthread_barrier_init(&sync.barrier, &barrierattr, 2);
+		pthread_barrierattr_destroy(&barrierattr);
+	}
+
+}SharedMemoryContents;//the imformation of kernels' schedule
+
+map<string, vector<float>> Kernel_ipc;//all rodinia programmer kernels' ipc
+void schedule_with_fullPack(vector<schedule> *kernel_schedule, vector<schedule> Kernel_list_name, int sum_weight, int num_of_Kernel)
+{
+	float **V = new float *[num_of_Kernel + 5];//init the pack
+	for (int i = 0; i <= num_of_Kernel; i++)
+		V[i] = new float[sum_weight + 5];
+	for (int i = 0; i <= num_of_Kernel; i++)
+		V[i][0] = 0;
+	for (int i = 0; i <= sum_weight; i++)
+		V[0][i] = 0;
+	vector<schedule> detail[100][40];//show the detail of the schedule
+	for (int i = 1; i <= num_of_Kernel; i++)//the full pack algorithm
+	{
+		for (int j = 1; j <= sum_weight; j++)
+		{
+			V[i][j] = V[i - 1][j];
+			detail[i][j] = detail[i - 1][j];
+			for (int m = 1; m <= j; m++)
+				if (V[i - 1][j - m] + Kernel_ipc[Kernel_list_name[i - 1].kernel_name][m - 1] > V[i][j])//V[i][j]=max(V[i-1][j-m]+g(i,m)) m=0,1,2,3......,10
+				{
+					V[i][j] = V[i - 1][j - m] + Kernel_ipc[Kernel_list_name[i - 1].kernel_name][m - 1];
+					detail[i][j] = detail[i - 1][j - m];
+					schedule tmp;
+					tmp.kernel_name = Kernel_list_name[i - 1].kernel_name;
+					tmp.id = Kernel_list_name[i - 1].id;
+					tmp.GPU_ratio = m;
+					detail[i][j].push_back(tmp);
+				}
+		}
+	}
+	*kernel_schedule = detail[num_of_Kernel][sum_weight];
+	//int max = V[num_of_Kernel][sum_weight];
+}
+void schedule_with_greedy(vector<schedule> *kernel_schedule, vector<schedule> Kernel_list_name, int sum_weight, int num_of_Kernel)
+{
+	schedule tmp;
+	vector<float> delta_ipc;
+	vector<float> tmp_Kernel;
+	int maxdelta_ipc = 0;
+	for (int i = 0; i < num_of_Kernel; i++)//init the delta_ipc
+	{
+		tmp.kernel_name = Kernel_list_name[i].kernel_name;
+		tmp.id = Kernel_list_name[i].id;
+		tmp.GPU_ratio = 0;
+		(*kernel_schedule).push_back(tmp);
+		delta_ipc.push_back(0);
+	}
+	while ((sum_weight--) > 0)
+	{
+		for (int i = 0; i < delta_ipc.size(); i++)
+		{
+			if ((*kernel_schedule)[i].GPU_ratio < 10)
+			{
+				tmp_Kernel = Kernel_ipc[Kernel_list_name[i].kernel_name];
+				int nowWeight = (*kernel_schedule)[i].GPU_ratio;
+				delta_ipc[i] = tmp_Kernel[nowWeight + 1] - tmp_Kernel[nowWeight];
+			}
+			else
+				delta_ipc[i] = 0;
+		}
+		int max_delta_ipc = 0;
+		int max_delta_ipc_pos = -1;
+		for (int i = 0; i < delta_ipc.size(); i++)
+		{
+			if (delta_ipc[i] > max_delta_ipc)
+			{
+				max_delta_ipc = delta_ipc[i];
+				max_delta_ipc_pos = i;
+			}
+		}
+		if (max_delta_ipc_pos != -1)
+			(*kernel_schedule)[max_delta_ipc_pos].GPU_ratio++;
+		maxdelta_ipc += max_delta_ipc;
+	}
+	vector<schedule> kernel_scheduletmp;
+	for (int i = 0; i < (*kernel_schedule).size(); i++)
+	{
+		if ((*kernel_schedule)[i].GPU_ratio > 0)
+			kernel_scheduletmp.push_back((*kernel_schedule)[i]);
+	}
+	*kernel_schedule = kernel_scheduletmp;
+	//int max = maxdelta_ipc;
+}
+int main()
+{
+	int shm_ret;
+	fstream file("data_ipc.txt");
+	vector<float> tmp;
+	int tmpid = 0;
+	string strTmp1, strTmp2, Kernel_name;
+	//read the ipc
+	while (getline(file, strTmp1))
+	{
+		istringstream ss(strTmp1);
+		ss >> Kernel_name;
+		while (ss >> strTmp2)
+			tmp.push_back(stof(strTmp2));
+		Kernel_ipc[Kernel_name] = tmp;
+		tmp.clear();
+	}
+	
+
+	while (true)
+	{
+		vector<schedule> *kernel_schedule;//Kernel's schedule
+		vector<SharedMemoryContents> *pKernel_list_name;
+		
+		//��ȡ���̳������еȴ���KernelȻ����õ����㷨
+		int fd = shm_open(getenv("SHARED_MEMORY_FNAME"), O_RDWR, S_IRUSR | S_IWUSR);
+		assert(fd != -1);
+		void *init_ptr = mmap(NULL, SHARED_SIZE,
+			PROT_READ | PROT_WRITE,
+			MAP_SHARED, fd, 0);
+		pKernel_list_name = (vector<SharedMemoryContents> *) init_ptr;//����ȡ�Ĺ����ڴ�ֵת��Ϊ���Ƚṹ
+
+
+		assert(close(fd) != -1);
+		vector<schedule> *need_schedule = new vector<schedule>;
+		map<int, int> Kernel_position;
+		//�ҵ��ܹ����ȵ�Kernel
+		for (int i = 0; i < (*pKernel_list_name).size(); i++)
+		{
+			if ((*pKernel_list_name)[i].sch.process_flag == 0 && (*pKernel_list_name)[i].sch.change_flag == 1)
+			{
+				(*need_schedule).push_back((*pKernel_list_name)[i].sch);
+				Kernel_position[(*pKernel_list_name)[i].sch.id] = i;
+			}
+		}
+		
+		//choose one
+		//schedule_with_greedy(kernel_schedule, need_schedule, 10, (*need_schedule).size());
+		//schedule_with_fullPack(kernel_schedule, need_schedule, 10, (*need_schedule).size());
+		//��������Ϣת��Ϊ������hook�˵���Ϣ,���޸���Ӧ��־λ
+		for (int i = 0; i < (*kernel_schedule).size(); i++)
+		{
+			int Kernel_pos = Kernel_position[(*kernel_schedule)[i].id];
+			(*pKernel_list_name)[Kernel_pos].sch = (*kernel_schedule)[i];
+			(*pKernel_list_name)[Kernel_pos].sch.process_flag = 1;//��ʾ������Ͽ��Կ�ʼִ��
+		}
+		init_ptr = (void *)pKernel_list_name;
+		//��������Ϣ���䵽hook��ȥ
+	}
+}
